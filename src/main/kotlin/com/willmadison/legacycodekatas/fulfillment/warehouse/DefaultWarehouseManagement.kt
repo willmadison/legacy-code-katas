@@ -1,0 +1,3 @@
+package com.willmadison.legacycodekatas.fulfillment.warehouse
+
+class DefaultWarehouseManagement: WarehouseManagement
