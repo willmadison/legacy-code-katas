@@ -1,8 +1,8 @@
 package com.willmadison.legacycodekatas
 
 import com.willmadison.legacycodekatas.fulfillment.orders.DefaultOrderService
-import com.willmadison.legacycodekatas.fulfillment.warehouse.DefaultConsolidation
-import com.willmadison.legacycodekatas.fulfillment.warehouse.DefaultWarehouseManagement
+import com.willmadison.legacycodekatas.fulfillment.warehouse.consolidation.DefaultConsolidation
+import com.willmadison.legacycodekatas.fulfillment.warehouse.management.DefaultWarehouseManagement
 import com.willmadison.legacycodekatas.fulfillment.warehouse.Message
 import com.willmadison.legacycodekatas.fulfillment.warehouse.exceptions.configuration.ExceptionConfiguration
 import org.springframework.boot.autoconfigure.SpringBootApplication

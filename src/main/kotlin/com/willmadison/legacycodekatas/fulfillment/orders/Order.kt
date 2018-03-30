@@ -1,8 +1,12 @@
 package com.willmadison.legacycodekatas.fulfillment.orders
 
-import java.util.HashMap
+import java.time.LocalDateTime
+import java.util.*
 
-class Order {
+class Order(val id: String, val number: Int, val type: OrderType,
+            val reservationId: String, val items: Collection<OrderItem>,
+            var status: Status, val transactionId: String, var completionDate: LocalDateTime) {
+
     enum class Status(val statusId: Int) {
         NEW(1),
         REPLENISHING(2),
