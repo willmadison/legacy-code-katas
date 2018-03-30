@@ -4,7 +4,10 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.willmadison.legacycodekatas.fulfillment.orders.*
 import com.willmadison.legacycodekatas.fulfillment.orders.SearchParameters
 import com.willmadison.legacycodekatas.fulfillment.warehouse.Message
+import com.willmadison.legacycodekatas.fulfillment.warehouse.consolidation.ConsolidatableOrder
+import com.willmadison.legacycodekatas.fulfillment.warehouse.consolidation.ConsolidatableOrderItem
 import com.willmadison.legacycodekatas.fulfillment.warehouse.consolidation.Consolidation
+import com.willmadison.legacycodekatas.fulfillment.warehouse.consolidation.Label
 import com.willmadison.legacycodekatas.fulfillment.warehouse.exceptions.configuration.ExceptionConfiguration
 import com.willmadison.legacycodekatas.fulfillment.warehouse.management.*
 import org.slf4j.Logger
@@ -124,7 +127,7 @@ class ExceptionHandler(private val orderService: OrderService, private val wms: 
             ++submissions
 
             exceptionHandlingService.submit {
-                handleConsolidateableOrderExceptions(multiLineOrders, orderType, configuration)
+                handleConsolidatableOrderExceptions(multiLineOrders, orderType, configuration)
                 true
             }
             ++submissions
@@ -193,7 +196,7 @@ class ExceptionHandler(private val orderService: OrderService, private val wms: 
                     logger.info("Found {} picks for {} Order #{} (primeTid: {})", picks.size, orderType, orderNumber, order.transactionId)
 
                     for (pick in picks) {
-                        val orderItemId = pick.orerItemId
+                        val orderItemId = pick.orderItemId
 
                         if (!picksByOrderItemId.containsKey(orderItemId)) {
                             picksByOrderItemId[orderItemId] = ArrayList()
@@ -346,8 +349,208 @@ class ExceptionHandler(private val orderService: OrderService, private val wms: 
         logger.info("{} exceptions handled of the {} non-consolidateable {} orders...", numOrdersProcessed, orders.size, orderType)
     }
 
-    private fun handleConsolidateableOrderExceptions(orders: Collection<Order>, orderType: OrderType, configuration: ExceptionConfiguration) {
-        TODO("not implemented") //To change body of created functions use File | Settings | File Templates.
+    private fun handleConsolidatableOrderExceptions(orders: Collection<Order>, orderType: OrderType, configuration: ExceptionConfiguration) {
+        logger.info("Handling exceptions for {} consolidateable {} orders...", orders.size, orderType)
+
+        val repickableStatuses = EnumSet.of<OrderItem.Status>(OrderItem.Status.WIP,
+                OrderItem.Status.STRAGGLED, OrderItem.Status.PICKED)
+
+        var numOrdersProcessed = 0
+
+        for (order in orders) {
+            val orderNumber = order.number
+
+            var consolidatableOrder: ConsolidatableOrder?
+
+            logger.info("Looking up consolidation status for {} Order #{}...(primeTid: {})", orderType, orderNumber, order.transactionId)
+            consolidatableOrder = consolidation.status(orderNumber, order.transactionId)
+
+            val searchParameters = com.willmadison.legacycodekatas.fulfillment.warehouse.management.SearchParameters(orderNumber = orderNumber)
+
+            val picksByOrderItemId = HashMap<String, MutableCollection<Pick>>()
+
+            try {
+                logger.info("Looking up picks for {} Order #{} (primeTid: {})", orderType, orderNumber, order.transactionId)
+
+                val pickSearchRequest = PickSearchRequest(searchParameters, order.transactionId)
+                val pickSearchResponse = wms.search(pickSearchRequest)
+
+                val picks = pickSearchResponse.picks
+
+                if (!CollectionUtils.isEmpty(picks)) {
+                    logger.info("Found {} picks for {} Order #{} (primeTid: {})", picks.size, orderType, orderNumber, order.transactionId)
+
+                    for (pick in picks) {
+                        val orderItemId = pick.orderItemId
+
+                        if (!picksByOrderItemId.containsKey(orderItemId)) {
+                            picksByOrderItemId[orderItemId] = ArrayList()
+                        }
+
+                        picksByOrderItemId[orderItemId]?.add(pick)
+                    }
+                } else {
+                    logger.warn("No picks found for {} Order #{}! (primeTid: {})", orderType, orderNumber, order.transactionId)
+                }
+            } catch (e: Exception) {
+                logger.info("Encountered an exception attempting to retrieve the picks for {} Order #{}! (primeTid: {})",
+                        orderType, orderNumber, order.transactionId, e)
+            }
+
+            val consolidatedItemsByPickId = HashMap<Int, ConsolidatableOrderItem>()
+
+            if (consolidatableOrder != null) {
+                for (item in consolidatableOrder.items) {
+                    try {
+                        consolidatedItemsByPickId[Integer.parseInt(item.id)] = item
+                    } catch (nfe: NumberFormatException) {
+                        logger.warn("Encountered NumberFormatException attempting to parse the identifier for the following consolidateable item: {}", item)
+                    }
+
+                }
+
+                logger.info("Retrieved consolidateable order with {} items for {} Order #{}. Checking for auto-straggle" + " candidates... (primeTid: {})", consolidatableOrder.items.size, order.type, orderNumber, order.transactionId)
+
+                val maxAutoRepicks = configuration.maxAutoStraggles
+
+                for (item in order.items) {
+                    if (!repickableStatuses.contains(item.status)) {
+                        logger.info("Order Item {} on {} Order #{} is in {} status which is not a repickable status! Skipping! (primeTid: {})",
+                                item.id, order.type, order.number, item.status, order.transactionId)
+                        continue
+                    }
+
+                    val orderItemId = item.id
+
+                    val picksForItem = picksByOrderItemId[orderItemId]
+
+                    if (picksForItem != null) {
+                        var consolidatedItem: ConsolidatableOrderItem? = null
+                        var repickCandidate: Pick? = null
+
+                        for (pick in picksForItem) {
+                            consolidatedItem = consolidatedItemsByPickId[pick.id]
+
+                            if (consolidatedItem != null) {
+                                repickCandidate = pick
+                                break
+                            }
+                        }
+
+                        if (consolidatedItem != null && repickCandidate != null) {
+                            val lastUpdate = consolidatedItem.lastUpdate.atZone(ZoneId.of("UTC"))
+                            val repickTimeframe = Duration.ofMinutes(configuration.autoStraggleTimeframeMinutes)
+                            var repickTimeThreshold = lastUpdate.plus(repickTimeframe).toLocalDateTime()
+
+                            val now = LocalDateTime.now(ZoneId.of("UTC"))
+                            repickTimeThreshold = repickTimeThreshold.atZone(ZoneId.of("UTC")).toLocalDateTime()
+
+                            //TODO: Need to update this to ensure that the pick was actually attempted to be worked based on release date....
+                            val pickWasWorked = repickCandidate.status != null || repickCandidate.wmsUserId != null
+                            val repickTimeframePassed = now.isAfter(repickTimeThreshold)
+
+                            val suspended = repickCandidate.status != null && Pick.Status.SUSPENDED == repickCandidate.status
+                            val pickDeemedOut = repickCandidate.straggled && repickCandidate.skill.stragglerSkill == null && suspended
+
+                            val performAutoRepick = pickWasWorked && item.released && !consolidatedItem.placed && repickTimeframePassed && !pickDeemedOut
+
+                            if (consolidatedItem.placed) {
+                                item.status = OrderItem.Status.PLACED
+                            }
+
+                            if (performAutoRepick) {
+                                logger.warn("Preparing to attempt to auto repick Order Item {} on {} Order #{}! (Last Update {}) (primeTid: {}).", item.id,
+                                        orderType, order.number, lastUpdate, order.transactionId)
+
+                                if (configuration.autoStraggleEnabled) {
+                                    var numRepicks = item.numStraggles
+
+                                    if (numRepicks < maxAutoRepicks) {
+                                        val pickSkill = repickCandidate.skill
+
+                                        val repickSkill = pickSkill.stragglerSkill ?: pickSkill
+
+                                        repickCandidate.skill = repickSkill
+                                        repickCandidate.status = null
+                                        repickCandidate.wmsUserId = null
+                                        repickCandidate.straggled = true
+                                        repickCandidate.updateDate = LocalDateTime.now()
+                                        repickCandidate.quantity = 0.0
+
+                                        try {
+                                            val request = PickSaveRequest(repickCandidate, order.transactionId)
+                                            wms.save(request)
+                                            item.numStraggles = ++numRepicks
+                                        } catch (e: Exception) {
+                                            logger.info("Encountered an error attempting to repick the most recent pick" + " for Order Item {} on {} Order #{}! (primeTid: {})", item.id, orderType,
+                                                    order.number, order.transactionId, e)
+                                        }
+
+                                        val label = Label(label = "Repicked (In Flight)")
+
+                                        consolidation.updateOrderItemLabel(Integer.toString(orderNumber), consolidatedItem.id, label)
+                                    } else {
+                                        logger.warn("Unable to auto repick Order Item {} on {} Order #{}! Item has already been repicked {} time(s). (Max # of automatic repicks {})! (primeTid: {})", item.id,
+                                                orderType, order.number, numRepicks, maxAutoRepicks, order.transactionId)
+                                    }
+                                } else {
+                                    logger.info("Found auto-repick eligible consolidateable Pick {} for Order Item {} on Order #{}. Auto-repick is disabled. (primeTid: {})",
+                                            repickCandidate.id, item.id, orderType, order.number, order.transactionId)
+                                }
+                            } else {
+                                logger.info("No need to auto-repick consolidateable Pick {} for Order Item {} on {} Order #{}. " + "(Pick Was Worked? {}, Item Released? {}, Item Placed? {}, Pick Deemed Out By Straggler? {}, Last Update: {}) (primeTid: {})",
+                                        repickCandidate.id, item.id, orderType, order.number,
+                                        pickWasWorked, item.released, consolidatedItem.placed, pickDeemedOut,
+                                        consolidatedItem.lastUpdate, order.transactionId)
+                            }
+                        } else {
+                            logger.warn("Unable to find a consolidated item for Order Item {} on {} Order #{} " + "(Picks for this Order Item: {}, Consolidateable Order: {}) (primeTid: {})", orderItemId,
+                                    order.type, order.number, picksForItem, consolidatableOrder, order.transactionId)
+                        }
+                    } else {
+                        logger.warn("No picks found for Item {} on {} Order #{}! (primeTid: {})", orderItemId, orderType, orderNumber, order.transactionId)
+                    }
+                }
+            } else {
+                logger.warn("Unable to find a consolidated order for {} Order #{}! (primeTid: {})", order.type,
+                        order.number, order.transactionId)
+            }
+
+            var allItemsPlaced = true
+            var allItemsShipped = true
+
+            for (item in order.items) {
+                if (OrderItem.Status.DELETED == item.status) {
+                    continue
+                }
+
+                if (OrderItem.Status.PLACED != item.status) {
+                    allItemsPlaced = false
+                    break
+                }
+            }
+
+            for (item in order.items) {
+                if (OrderItem.Status.DELETED == item.status) {
+                    continue
+                }
+
+                if (!item.shipped) {
+                    allItemsShipped = false
+                    break
+                }
+            }
+
+            if (allItemsPlaced || allItemsShipped) {
+                order.status = Order.Status.COMPLETE
+                order.completionDate = LocalDateTime.now()
+            }
+
+            orderService.save(order)
+            ++numOrdersProcessed
+        }
+
+        logger.info("{} exceptions handled of the {} consolidateable {} orders...", numOrdersProcessed, orders.size, orderType)
     }
 
 }
