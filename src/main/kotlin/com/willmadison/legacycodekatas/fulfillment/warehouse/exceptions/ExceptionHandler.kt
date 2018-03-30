@@ -29,8 +29,12 @@ class ExceptionHandler(private val orderService: OrderService, private val wms: 
         const val MAX_BACKGROUND_EXCEPTION_HANDLERS = 8
     }
 
+    private val backgroundExceptionHandlers = Executors.newFixedThreadPool(MAX_BACKGROUND_EXCEPTION_HANDLERS)
+
+    private val backgroundOrderExceptionHandlers = Executors.newFixedThreadPool(OrderType.values().size)
 
     private val logger: Logger = LoggerFactory.getLogger(ExceptionHandler::class.java)
+
 
     @Scheduled(cron = "0 0/1 * * * *")  // Every minute...
     fun handleExceptions() {
@@ -43,8 +47,6 @@ class ExceptionHandler(private val orderService: OrderService, private val wms: 
                 for (orderType in configuration.supportedOrderTypes) {
                     orderTypes.add(orderType)
                 }
-
-                val backgroundOrderExceptionHandlers = Executors.newFixedThreadPool(OrderType.values().size)
 
                 val exceptionHandlingCompletionService = ExecutorCompletionService<Boolean>(backgroundOrderExceptionHandlers)
 
@@ -112,9 +114,6 @@ class ExceptionHandler(private val orderService: OrderService, private val wms: 
 
             var completions = 0
             var submissions = 0
-
-            val backgroundExceptionHandlers = Executors.newFixedThreadPool(MAX_BACKGROUND_EXCEPTION_HANDLERS)
-
 
             val exceptionHandlingService = ExecutorCompletionService<Boolean>(backgroundExceptionHandlers)
 
@@ -347,10 +346,8 @@ class ExceptionHandler(private val orderService: OrderService, private val wms: 
         logger.info("{} exceptions handled of the {} non-consolidateable {} orders...", numOrdersProcessed, orders.size, orderType)
     }
 
-
     private fun handleConsolidateableOrderExceptions(orders: Collection<Order>, orderType: OrderType, configuration: ExceptionConfiguration) {
         TODO("not implemented") //To change body of created functions use File | Settings | File Templates.
     }
-
 
 }
