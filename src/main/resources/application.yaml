@@ -1,5 +1,6 @@
 exceptions:
   enabled: true
+  warehouseOperational: true
 
 cloud:
   aws:
