@@ -1,5 +1,9 @@
 package com.willmadison.legacycodekatas.fulfillment.warehouse.exceptions;
 
+import com.fasterxml.jackson.annotation.JsonAnyGetter;
+import com.fasterxml.jackson.annotation.JsonAnySetter;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.willmadison.legacycodekatas.fulfillment.orders.Order;
 import com.willmadison.legacycodekatas.fulfillment.orders.Order.Type;
@@ -17,7 +21,9 @@ import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.util.CollectionUtils;
+import org.springframework.util.StringUtils;
 
+import java.io.IOException;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
@@ -32,6 +38,8 @@ public class ExceptionHandler {
 
     private static final int MAX_BACKGROUND_EXCEPTION_HANDLERS = 8;
 
+    private static final int MAX_BACKGROUND_PICK_COMPLETION_HANDLERS = 10;
+
     private final OrderService orderService;
 
     private final WarehouseManagement wms;
@@ -42,11 +50,13 @@ public class ExceptionHandler {
 
     private final ExceptionConfiguration configuration;
 
-    private ObjectMapper objectMapper = new ObjectMapper();
+    private ObjectMapper mapper = new ObjectMapper();
 
     private ExecutorService backgroundExceptionHandlers = Executors.newFixedThreadPool(MAX_BACKGROUND_EXCEPTION_HANDLERS);
 
     private ExecutorService backgroundOrderExceptionHandlers = Executors.newFixedThreadPool(Type.values().length);
+
+    private ExecutorService backgroundPickCompletionHandlers = Executors.newFixedThreadPool(MAX_BACKGROUND_PICK_COMPLETION_HANDLERS);
 
     private Logger logger = LoggerFactory.getLogger(ExceptionHandler.class);
 
@@ -182,7 +192,7 @@ public class ExceptionHandler {
             searchParameters.orderNumber = orderNumber;
 
             try {
-                logger.info("Looking up order verification status for {} Order #{} (primeTid: {})", orderType, orderNumber, order.transactionId);
+                logger.info("Looking up order verification status for {} Order #{} (transactionId: {})", orderType, orderNumber, order.transactionId);
 
                 OrderVerificationSearchRequest orderVerificationSearch = new OrderVerificationSearchRequest(searchParameters, order.transactionId);
                 OrderVerificationSearchResponse orderVerificationSearchResponse = wms.search(orderVerificationSearch);
@@ -190,7 +200,7 @@ public class ExceptionHandler {
                 Collection<OrderVerification> orderVerifications = orderVerificationSearchResponse.verifications;
 
                 if (!orderVerifications.isEmpty()) {
-                    logger.info("Found {} order verification records for {} Order #{} (primeTid: {})", orderVerifications.size(),
+                    logger.info("Found {} order verification records for {} Order #{} (transactionId: {})", orderVerifications.size(),
                             orderType, orderNumber, order.transactionId);
 
                     for (OrderVerification verification : orderVerifications) {
@@ -200,15 +210,15 @@ public class ExceptionHandler {
                         }
                     }
                 } else {
-                    logger.warn("No order verifications for {} Order #{}! (primeTid: {})", orderType, orderNumber, order.transactionId);
+                    logger.warn("No order verifications for {} Order #{}! (transactionId: {})", orderType, orderNumber, order.transactionId);
                 }
             } catch (Exception e) {
-                logger.info("Encountered an exception attempting to retrieve the order verification status for {} Order #{}! (primeTid: {})",
+                logger.info("Encountered an exception attempting to retrieve the order verification status for {} Order #{}! (transactionId: {})",
                         orderType, orderNumber, order.transactionId, e);
             }
 
             try {
-                logger.info("Looking up picks for {} Order #{} (primeTid: {})", orderType, orderNumber, order.transactionId);
+                logger.info("Looking up picks for {} Order #{} (transactionId: {})", orderType, orderNumber, order.transactionId);
 
                 PickSearchRequest pickSearchRequest = new PickSearchRequest(searchParameters, order.transactionId);
                 PickSearchResponse pickSearchResponse = wms.search(pickSearchRequest);
@@ -216,7 +226,7 @@ public class ExceptionHandler {
                 Collection<Pick> picks = pickSearchResponse.picks;
 
                 if (!CollectionUtils.isEmpty(picks)) {
-                    logger.info("Found {} picks for {} Order #{} (primeTid: {})", picks.size(), orderType, orderNumber, order.transactionId);
+                    logger.info("Found {} picks for {} Order #{} (transactionId: {})", picks.size(), orderType, orderNumber, order.transactionId);
 
                     for (Pick pick : picks) {
                         String orderItemId = pick.orderItemId;
@@ -228,10 +238,10 @@ public class ExceptionHandler {
                         picksByOrderItemId.get(orderItemId).add(pick);
                     }
                 } else {
-                    logger.warn("No picks found for {} Order #{}! (primeTid: {})", orderType, orderNumber, order.transactionId);
+                    logger.warn("No picks found for {} Order #{}! (transactionId: {})", orderType, orderNumber, order.transactionId);
                 }
             } catch (Exception e) {
-                logger.info("Encountered an exception attempting to retrieve the picks for {} Order #{}! (primeTid: {})",
+                logger.info("Encountered an exception attempting to retrieve the picks for {} Order #{}! (transactionId: {})",
                         orderType, orderNumber, order.transactionId, e);
             }
 
@@ -263,16 +273,16 @@ public class ExceptionHandler {
                     order.status = Order.Status.COMPLETE;
                     order.completedOn = LocalDateTime.now(ZoneId.of("UTC"));
                 } else {
-                    logger.info("{} Order #{} has been scan verified but not all items have shipped. Leaving in WIP status... " + "(primeTid: {})", orderType, orderNumber, order.transactionId);
+                    logger.info("{} Order #{} has been scan verified but not all items have shipped. Leaving in WIP status... " + "(transactionId: {})", orderType, orderNumber, order.transactionId);
                 }
             } else {
-                logger.info("{} Order #{} has not completed scan verification. Checking for auto-repick candidates... (primeTid: {})", orderType, orderNumber, order.transactionId);
+                logger.info("{} Order #{} has not completed scan verification. Checking for auto-repick candidates... (transactionId: {})", orderType, orderNumber, order.transactionId);
 
                 int maxAutoRepicks = configuration.maxAutoStraggles;
 
                 for (OrderItem item : order.items) {
                     if (!repickableStatuses.contains(item.status)) {
-                        logger.info("Order Item {} on {} Order #{} is in {} status which is not a repickable status! Skipping! (primeTid: {})",
+                        logger.info("Order Item {} on {} Order #{} is in {} status which is not a repickable status! Skipping! (transactionId: {})",
                                 item.id, order.type, order.number, item.status, order.transactionId);
                         continue;
                     }
@@ -310,7 +320,7 @@ public class ExceptionHandler {
                         boolean performAutoRepick = pickWasWorked && item.released && repickTimeframePassed && !pickDeemedOut;
 
                         if (performAutoRepick) {
-                            logger.warn("Preparing to attempt to auto repick Order Item {} on {} Order #{}! (Last Update {}) (primeTid: {}).", item.id,
+                            logger.warn("Preparing to attempt to auto repick Order Item {} on {} Order #{}! (Last Update {}) (transactionId: {}).", item.id,
                                     orderType, order.number, lastUpdate, order.transactionId);
 
                             if (configuration.autoStraggleEnabled) {
@@ -339,25 +349,25 @@ public class ExceptionHandler {
                                         wms.save(request);
                                         item.numStraggles = ++numRepicks;
                                     } catch (Exception e) {
-                                        logger.info("Encountered an error attempting to re-pick the most recent pick  for Order Item {} on {} Order #{}! (primeTid: {})", item.id, orderType,
+                                        logger.info("Encountered an error attempting to re-pick the most recent pick  for Order Item {} on {} Order #{}! (transactionId: {})", item.id, orderType,
                                                 order.number, order.transactionId, e);
                                     }
 
                                 } else {
-                                    logger.warn("Unable to auto repick Order Item {} on {} Order #{}! Item has already been repicked" + "{} time(s). (Max # of automatic repicks {}) (primeTid: {})!", item.id,
+                                    logger.warn("Unable to auto repick Order Item {} on {} Order #{}! Item has already been repicked" + "{} time(s). (Max # of automatic repicks {}) (transactionId: {})!", item.id,
                                             orderType, order.number, numRepicks, maxAutoRepicks, order.transactionId);
                                 }
                             } else {
-                                logger.info("Found auto-repick eligible Pick {} for Order Item {} on Order #{}. Auto-repick is disabled. (primeTid: {})",
+                                logger.info("Found auto-repick eligible Pick {} for Order Item {} on Order #{}. Auto-repick is disabled. (transactionId: {})",
                                         mostRecentPick.id, item.id, orderType, order.number, order.transactionId);
                             }
                         } else {
-                            logger.info("No need to auto-repick Pick {} for Order Item {} on {} Order #{}. " + "(Pick Was Worked? {}, Item Released? {}, Pick Deemed Out By Straggler? {}, Last Update: {}) (primeTid: {})",
+                            logger.info("No need to auto-repick Pick {} for Order Item {} on {} Order #{}. " + "(Pick Was Worked? {}, Item Released? {}, Pick Deemed Out By Straggler? {}, Last Update: {}) (transactionId: {})",
                                     mostRecentPick.id, item.id, orderType, order.number,
                                     pickWasWorked, item.released, pickDeemedOut, lastUpdate, order.transactionId);
                         }
                     } else {
-                        logger.warn("No picks found for Item {} on {} Order #{}! (primeTid: {})", orderItemId, orderType,
+                        logger.warn("No picks found for Item {} on {} Order #{}! (transactionId: {})", orderItemId, orderType,
                                 orderNumber, order.transactionId);
                     }
                 }
@@ -384,7 +394,7 @@ public class ExceptionHandler {
 
             ConsolidatableOrder consolidatableOrder = null;
 
-            logger.info("Looking up consolidation status for {} Order #{}...(primeTid: {})", orderType, orderNumber, order.transactionId);
+            logger.info("Looking up consolidation status for {} Order #{}...(transactionId: {})", orderType, orderNumber, order.transactionId);
             consolidatableOrder = consolidation.status(orderNumber, order.transactionId);
 
             com.willmadison.legacycodekatas.fulfillment.warehouse.management.SearchParameters searchParameters = new com.willmadison.legacycodekatas.fulfillment.warehouse.management.SearchParameters();
@@ -394,7 +404,7 @@ public class ExceptionHandler {
 
             //noinspection Duplicates
             try {
-                logger.info("Looking up picks for {} Order #{} (primeTid: {})", orderType, orderNumber, order.transactionId);
+                logger.info("Looking up picks for {} Order #{} (transactionId: {})", orderType, orderNumber, order.transactionId);
 
                 PickSearchRequest pickSearchRequest = new PickSearchRequest(searchParameters, order.transactionId);
                 PickSearchResponse pickSearchResponse = wms.search(pickSearchRequest);
@@ -402,7 +412,7 @@ public class ExceptionHandler {
                 Collection<Pick> picks = pickSearchResponse.picks;
 
                 if (!CollectionUtils.isEmpty(picks)) {
-                    logger.info("Found {} picks for {} Order #{} (primeTid: {})", picks.size(), orderType, orderNumber, order.transactionId);
+                    logger.info("Found {} picks for {} Order #{} (transactionId: {})", picks.size(), orderType, orderNumber, order.transactionId);
 
                     for (Pick pick : picks) {
                         String orderItemId = pick.orderItemId;
@@ -414,10 +424,10 @@ public class ExceptionHandler {
                         picksByOrderItemId.get(orderItemId).add(pick);
                     }
                 } else {
-                    logger.warn("No picks found for {} Order #{}! (primeTid: {})", orderType, orderNumber, order.transactionId);
+                    logger.warn("No picks found for {} Order #{}! (transactionId: {})", orderType, orderNumber, order.transactionId);
                 }
             } catch (Exception e) {
-                logger.info("Encountered an exception attempting to retrieve the picks for {} Order #{}! (primeTid: {})",
+                logger.info("Encountered an exception attempting to retrieve the picks for {} Order #{}! (transactionId: {})",
                         orderType, orderNumber, order.transactionId, e);
             }
 
@@ -433,13 +443,13 @@ public class ExceptionHandler {
 
                 }
 
-                logger.info("Retrieved consolidateable order with {} items for {} Order #{}. Checking for auto-straggle" + " candidates... (primeTid: {})", consolidatableOrder.items.size(), order.type, orderNumber, order.transactionId);
+                logger.info("Retrieved consolidateable order with {} items for {} Order #{}. Checking for auto-straggle" + " candidates... (transactionId: {})", consolidatableOrder.items.size(), order.type, orderNumber, order.transactionId);
 
                 int maxAutoRepicks = configuration.maxAutoStraggles;
 
                 for (OrderItem item : order.items) {
                     if (!repickableStatuses.contains(item.status)) {
-                        logger.info("Order Item {} on {} Order #{} is in {} status which is not a repickable status! Skipping! (primeTid: {})",
+                        logger.info("Order Item {} on {} Order #{} is in {} status which is not a repickable status! Skipping! (transactionId: {})",
                                 item.id, order.type, order.number, item.status, order.transactionId);
                         continue;
                     }
@@ -482,7 +492,7 @@ public class ExceptionHandler {
                             }
 
                             if (performAutoRepick) {
-                                logger.warn("Preparing to attempt to auto repick Order Item {} on {} Order #{}! (Last Update {}) (primeTid: {}).", item.id,
+                                logger.warn("Preparing to attempt to auto repick Order Item {} on {} Order #{}! (Last Update {}) (transactionId: {}).", item.id,
                                         orderType, order.number, lastUpdate, order.transactionId);
 
                                 if (configuration.autoStraggleEnabled) {
@@ -505,7 +515,7 @@ public class ExceptionHandler {
                                             wms.save(request);
                                             item.numStraggles = ++numRepicks;
                                         } catch (Exception e) {
-                                            logger.info("Encountered an error attempting to repick the most recent pick" + " for Order Item {} on {} Order #{}! (primeTid: {})", item.id, orderType,
+                                            logger.info("Encountered an error attempting to repick the most recent pick" + " for Order Item {} on {} Order #{}! (transactionId: {})", item.id, orderType,
                                                     order.number, order.transactionId, e);
                                         }
 
@@ -513,29 +523,29 @@ public class ExceptionHandler {
 
                                         consolidation.updateOrderItemLabel(Integer.toString(orderNumber), consolidatedItem.id, label);
                                     } else {
-                                        logger.warn("Unable to auto repick Order Item {} on {} Order #{}! Item has already been repicked {} time(s). (Max # of automatic repicks {})! (primeTid: {})", item.id,
+                                        logger.warn("Unable to auto repick Order Item {} on {} Order #{}! Item has already been repicked {} time(s). (Max # of automatic repicks {})! (transactionId: {})", item.id,
                                                 orderType, order.number, numRepicks, maxAutoRepicks, order.transactionId);
                                     }
                                 } else {
-                                    logger.info("Found auto-repick eligible consolidateable Pick {} for Order Item {} on Order #{}. Auto-repick is disabled. (primeTid: {})",
+                                    logger.info("Found auto-repick eligible consolidateable Pick {} for Order Item {} on Order #{}. Auto-repick is disabled. (transactionId: {})",
                                             repickCandidate.id, item.id, orderType, order.number, order.transactionId);
                                 }
                             } else {
-                                logger.info("No need to auto-repick consolidateable Pick {} for Order Item {} on {} Order #{}. " + "(Pick Was Worked? {}, Item Released? {}, Item Placed? {}, Pick Deemed Out By Straggler? {}, Last Update: {}) (primeTid: {})",
+                                logger.info("No need to auto-repick consolidateable Pick {} for Order Item {} on {} Order #{}. " + "(Pick Was Worked? {}, Item Released? {}, Item Placed? {}, Pick Deemed Out By Straggler? {}, Last Update: {}) (transactionId: {})",
                                         repickCandidate.id, item.id, orderType, order.number,
                                         pickWasWorked, item.released, consolidatedItem.placed, pickDeemedOut,
                                         consolidatedItem.lastUpdate, order.transactionId);
                             }
                         } else {
-                            logger.warn("Unable to find a consolidated item for Order Item {} on {} Order #{} " + "(Picks for this Order Item: {}, Consolidateable Order: {}) (primeTid: {})", orderItemId,
+                            logger.warn("Unable to find a consolidated item for Order Item {} on {} Order #{} " + "(Picks for this Order Item: {}, Consolidateable Order: {}) (transactionId: {})", orderItemId,
                                     order.type, order.number, picksForItem, consolidatableOrder, order.transactionId);
                         }
                     } else {
-                        logger.warn("No picks found for Item {} on {} Order #{}! (primeTid: {})", orderItemId, orderType, orderNumber, order.transactionId);
+                        logger.warn("No picks found for Item {} on {} Order #{}! (transactionId: {})", orderItemId, orderType, orderNumber, order.transactionId);
                     }
                 }
             } else {
-                logger.warn("Unable to find a consolidated order for {} Order #{}! (primeTid: {})", order.type,
+                logger.warn("Unable to find a consolidated order for {} Order #{}! (transactionId: {})", order.type,
                         order.number, order.transactionId);
             }
 
@@ -574,5 +584,294 @@ public class ExceptionHandler {
         }
 
         logger.info("{} exceptions handled of the {} consolidateable {} orders...", numOrdersProcessed, orders.size(), orderType);
+    }
+
+    @Scheduled(cron = "0 0/1 * * * *") // Every 1 minutes...
+    private void checkForCompletedPicks() {
+        if (configuration.enabled) {
+            if (configuration.warehouseOperational) {
+                logger.info("Processing completed picks...");
+
+                Collection<Collection<Message>> messageBatches = batchPickCompletionMessages(queue);
+
+                if (!CollectionUtils.isEmpty(messageBatches)) {
+                    for (final Collection<Message> messages : messageBatches) {
+                        backgroundPickCompletionHandlers.submit(() -> processCompletedPicks(messages));
+                    }
+                } else {
+                    logger.info("No pick completion messages to process...");
+                }
+
+            } else {
+                logger.info("No need to process completed picks at this moment. Warehouse is not operational!");
+            }
+        } else {
+            logger.info("Exception handling is disabled. Unable to handle completed pick notifications!");
+        }
+    }
+
+    private Collection<Collection<Message>> batchPickCompletionMessages(Collection<Message> messages) {
+        Collection<Collection<Message>> messageBatches = new ArrayList<>();
+
+        if (!CollectionUtils.isEmpty(messages)) {
+            List<Message> messagesToPartition = new ArrayList<>(messages);
+
+            int numMessages = messagesToPartition.size();
+            int batchSize = numMessages / MAX_BACKGROUND_PICK_COMPLETION_HANDLERS;
+
+            if (batchSize > 1) {
+                int from = 0;
+                int to = from + batchSize;
+
+                while (from < numMessages) {
+                    if (to > numMessages) {
+                        to = numMessages;
+                    }
+
+                    messageBatches.add(messagesToPartition.subList(from, to));
+
+                    from += batchSize;
+                    to += batchSize;
+                }
+            } else {
+                messageBatches.add(messages);
+            }
+        }
+
+        return messageBatches;
+    }
+
+    private void processCompletedPicks(Collection<Message> pickCompletionMessages) {
+        String transactionId = UUID.randomUUID().toString();
+
+        Collection<PickCompleteNotification> pickCompleteNotifications = convertToPickCompletionNotifications(pickCompletionMessages);
+
+        Collection<Pick> completedPicks = retrieveCompletedPicks(pickCompleteNotifications, transactionId);
+
+        Collection<Integer> orderNumbers = new HashSet<>();
+        Map<String, Collection<Pick>> picksByOrderItemId = new HashMap<>();
+
+        if (!CollectionUtils.isEmpty(completedPicks)) {
+            logger.info("Found {} completed picks! Looking up the associated orders...", completedPicks.size());
+
+            for (Pick pick : completedPicks) {
+                String orderItemId = pick.orderItemId;
+                orderNumbers.add(pick.orderNumber);
+
+                if (!picksByOrderItemId.containsKey(orderItemId)) {
+                    picksByOrderItemId.put(orderItemId, new HashSet<>());
+                }
+
+                picksByOrderItemId.get(orderItemId).add(pick);
+            }
+
+            SearchParameters searchParameters = new SearchParameters();
+            searchParameters.orderNumbers = orderNumbers;
+            Collection<Order> orders = orderService.find(searchParameters);
+
+            if (!CollectionUtils.isEmpty(orders)) {
+                for (Order order : orders) {
+                    handlePickCompletion(order, picksByOrderItemId);
+                }
+            } else {
+                logger.warn("Found NO Cerebro Orders for the {} completed picks!", completedPicks.size());
+            }
+        }
+    }
+
+    private Collection<PickCompleteNotification> convertToPickCompletionNotifications(Collection<Message> pickCompletionMessages) {
+        Collection<PickCompleteNotification> notifications = new ArrayList<>();
+
+        for (Message message : pickCompletionMessages) {
+            String messageBody = message.getBody();
+
+            if (!StringUtils.isEmpty(messageBody)) {
+                // Fixes Bug #1234....
+                if (!messageBody.endsWith("}")) {
+                    messageBody += "}";
+                }
+
+                try {
+                    PickCompleteNotification notification = mapper.readValue(messageBody, PickCompleteNotification.class);
+                    notifications.add(notification);
+                } catch (IOException ioe) {
+                    logger.error("Encountered an error attempting to parse a pick completion notification!", ioe);
+                }
+            }
+        }
+
+        return notifications;
+    }
+
+    private Collection<Pick> retrieveCompletedPicks(Collection<PickCompleteNotification> pickCompleteNotifications, String transactionId) {
+        Collection<Pick> completedPicks = new HashSet<>();
+
+        Collection<Integer> pickIds = new HashSet<>();
+
+        if (!CollectionUtils.isEmpty(pickCompleteNotifications)) {
+            for (PickCompleteNotification notification : pickCompleteNotifications) {
+                pickIds.add(notification.getPickId());
+            }
+        }
+
+        com.willmadison.legacycodekatas.fulfillment.warehouse.management.SearchParameters pickSearchParameters = new com.willmadison.legacycodekatas.fulfillment.warehouse.management.SearchParameters();
+        pickSearchParameters.pickIds = pickIds;
+
+        PickSearchRequest pickSearchRequest = new PickSearchRequest(pickSearchParameters, transactionId);
+        PickSearchResponse pickSearchResponse = null;
+
+        try {
+            pickSearchResponse = wms.search(pickSearchRequest);
+            completedPicks = pickSearchResponse.picks;
+        } catch (Exception e) {
+            logger.error("Encountered an exception attempting to search for completed picks!", e);
+        }
+
+        return completedPicks;
+    }
+
+    private void handlePickCompletion(Order order, Map<String, Collection<Pick>> picksByOrderItemId) {
+        logger.info("Processing pick completion message for {} Order #{} (transactionId: {})!", order.type,
+                order.number, order.transactionId);
+
+        String reservationId = order.reservationId;
+
+        ConsolidatableOrder consolidatedOrder = consolidation.status(order.number, order.transactionId);
+
+        boolean isConsolidateableOrder = (!StringUtils.isEmpty(reservationId) && !reservationId.endsWith("-X")) || consolidatedOrder != null;
+
+        for (OrderItem orderItem : order.items) {
+            Collection<Pick> picks = picksByOrderItemId.get(orderItem.id);
+
+            if (!CollectionUtils.isEmpty(picks)) {
+                logger.info("Found {} picks for Order Item {} on {} Order #{} (transactionId: {})!", picks.size(),
+                        orderItem.id, order.type, order.number, order.transactionId);
+
+                Pick mostRecentPick = null;
+
+                for (Pick pick : picks) {
+                    if (mostRecentPick == null || pick.createdOn.isAfter(mostRecentPick.createdOn)) {
+                        mostRecentPick = pick;
+                    }
+                }
+
+                String updatedConsolidationLabel = "";
+                boolean isStraggled = mostRecentPick.straggled && mostRecentPick.skill.stragglerSkill == null;
+                Pick.Status pickStatus = mostRecentPick.status;
+
+                if (isStraggled) {
+                    orderItem.status = OrderItem.Status.STRAGGLED;
+
+                    String determination = mostRecentPick.fulfillmentStatus;
+                    determination = (": ".equalsIgnoreCase(determination)) ? "Unknown" : determination;
+                    boolean stragglerMadeDetermination = !"Unknown".equalsIgnoreCase(determination);
+
+                    if (!stragglerMadeDetermination) {
+                        updatedConsolidationLabel = "Repick (Pending)";
+                    } else {
+                        logger.info("Straggler Determination for Pick {}: {} (transactionId: {})", mostRecentPick.id,
+                                determination, order.transactionId);
+
+                        boolean isPartial = determination.toLowerCase().contains("partial");
+                        boolean isOut = determination.toLowerCase().contains("out");
+                        boolean isCompleted = determination.toLowerCase().contains("wip");
+
+                        if (isPartial || isOut) {
+                            if (isPartial) {
+                                updatedConsolidationLabel = "Partial";
+                            } else {
+                                updatedConsolidationLabel = "Out";
+                            }
+
+                            if (!isConsolidateableOrder) {
+                                logger.warn("Straggler determined {} Order #{} was out or partially available, holding in consolidation! (transactionId: {})",
+                                        order.type, order.number, order.transactionId);
+
+                                consolidation.hold(order.number, order.transactionId);
+                            }
+                        } else if (isCompleted) {
+                            updatedConsolidationLabel = "Repicked (Complete)";
+                        } else {
+                            updatedConsolidationLabel = determination;
+                        }
+                    }
+                } else {
+                    OrderItem.Status updatedStatus = orderItem.status;
+
+                    if (pickStatus != null) {
+                        switch (pickStatus) {
+                            case WIP:
+                            case PICKED:
+                                updatedConsolidationLabel = "Picked";
+                                updatedStatus = OrderItem.Status.PICKED;
+                                break;
+                            case ASSIGNED:
+                            case DELIVERED:
+                            case SUSPENDED:
+                                updatedConsolidationLabel = pickStatus.getDescription();
+                                break;
+                        }
+                    }
+
+                    orderItem.status = updatedStatus;
+                }
+
+                if (isConsolidateableOrder && !StringUtils.isEmpty(updatedConsolidationLabel)) {
+                    String orderNumber = Integer.toString(mostRecentPick.orderNumber);
+                    String consolidatedItemId = Integer.toString(mostRecentPick.id);
+                    Label label = new Label(updatedConsolidationLabel);
+
+                    consolidation.updateOrderItemLabel(orderNumber, consolidatedItemId, label);
+                }
+
+                orderService.save(orderItem);
+            }
+        }
+    }
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private static class PickCompleteNotification {
+
+        private int pickId;
+
+        private boolean straggler;
+
+        private Map<String, Object> others = new HashMap<>();
+
+        public int getPickId() {
+            return pickId;
+        }
+
+        @JsonProperty("id")
+        public void setPickId(int pickId) {
+            this.pickId = pickId;
+        }
+
+        public boolean isStraggler() {
+            return straggler;
+        }
+
+        public void setStraggler(boolean straggler) {
+            this.straggler = straggler;
+        }
+
+        @JsonAnyGetter
+        public Map<String, Object> any() {
+            return others;
+        }
+
+        @JsonAnySetter
+        public void set(String key, Object value) {
+            others.put(key, value);
+        }
+
+        @Override
+        public String toString() {
+            return "PickCompleteMessage{" +
+                    "pickId=" + pickId +
+                    ", straggler=" + straggler +
+                    ", others=" + others +
+                    '}';
+        }
     }
 }

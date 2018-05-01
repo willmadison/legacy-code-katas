@@ -11,4 +11,9 @@ public class DefaultConsolidation implements Consolidation {
     public void updateOrderItemLabel(String orderNumber, String itemId, Label label) {
 
     }
+
+    @Override
+    public void hold(int orderNumber, String transactionId) {
+
+    }
 }

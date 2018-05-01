@@ -14,4 +14,9 @@ public class DefaultOrderService implements OrderService {
     public void save(Order order) {
 
     }
+
+    @Override
+    public void save(OrderItem orderItem) {
+
+    }
 }
